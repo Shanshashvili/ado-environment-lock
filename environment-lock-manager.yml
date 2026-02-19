@@ -1,0 +1,165 @@
+### Pipeline description ###
+### This pipeline provides an environment-level lock for manual deployments. ###
+### It allows only one active run per selected target environment. ###
+### The run creates a tag in format env-<targetEnv> on the current build. ###
+### Then it checks active runs with the same tag and waits in queue order. ###
+### When this run becomes the oldest active one, execution continues. ###
+### It requires OAuth token access for scripts in pipeline settings. ###
+### Agent must have bash, curl, and python/python3 installed. ###
+### Current target environments: dev, qa, prod. ###
+
+### Disable a commit message into the run pipeline name ###
+appendCommitMessageToRunName: false
+
+### Only manual pipeline run ###
+trigger:
+  - none
+
+### Defining run parameters ###
+parameters:
+  - name: targetEnv
+    displayName: Target Environment
+    type: string
+    default: dev
+    values:
+    - dev
+    - qa
+    - prod
+
+variables:
+  - template: ../templates/variables-oboba.yml
+    parameters:
+      targetEnv: ${{ parameters.targetEnv }}
+
+### Defining the name of the pipeline run ###
+name: "[ Environment Lock Manager ] [ ${{ parameters.targetEnv }} ] [ $(Rev:r) ]"
+
+### Defining stages of the pipeline ###
+stages:
+  - stage: info
+    pool: $(agentPool)
+    displayName: Environment Lock
+    jobs:
+      - job: info
+        displayName: Manage Environment Lock
+        steps:
+        - checkout: none
+
+        - task: Bash@3
+          displayName: Register Environment Lock Tag
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              log_info() { printf '[INFO] %s\n' "$1"; }
+              log_warn() { printf '[WARN] %s\n' "$1"; }
+              log_error() { printf '[ERROR] %s\n' "$1"; }
+
+              if [ -z "${SYSTEM_ACCESSTOKEN:-}" ]; then
+                log_error "System.AccessToken is missing; cannot call Azure DevOps Build API."
+                log_warn "Enable: Pipeline settings -> Allow scripts to access the OAuth token."
+                exit 1
+              fi
+
+              lock_tag="env-$(targetEnv)"
+              project_id="$(System.TeamProjectId)"
+              build_id="$(Build.BuildId)"
+              org_url="$(System.CollectionUri)"
+              api_url="${org_url}${project_id}/_apis/build/builds/${build_id}/tags/${lock_tag}?api-version=7.1"
+
+              log_info "Registering environment lock tag '${lock_tag}' for run '${build_id}'."
+              log_info "Azure DevOps endpoint: ${api_url}"
+
+              auth_header=$(printf ':%s' "$SYSTEM_ACCESSTOKEN" | base64 | tr -d '\n')
+              http_code=$(curl -sS -o /dev/null -w "%{http_code}" -X PUT "$api_url" -H "Authorization: Basic ${auth_header}" -H "Content-Length: 0")
+
+              if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+                log_error "Failed to register lock tag '${lock_tag}' for run '${build_id}'."
+                log_error "Azure DevOps API returned HTTP ${http_code}."
+                exit 1
+              fi
+
+              log_info "Lock tag '${lock_tag}' successfully registered for run '${build_id}'."
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+        - task: Bash@3
+          displayName: Wait for Environment Lock Turn
+          inputs:
+            targetType: inline
+            script: |
+              set -euo pipefail
+
+              log_info() { printf '[INFO] %s\n' "$1"; }
+              log_warn() { printf '[WARN] %s\n' "$1"; }
+              log_error() { printf '[ERROR] %s\n' "$1"; }
+
+              if [ -z "${SYSTEM_ACCESSTOKEN:-}" ]; then
+                log_error "System.AccessToken is missing; cannot query active runs."
+                log_warn "Enable: Pipeline settings -> Allow scripts to access the OAuth token."
+                exit 1
+              fi
+
+              PYTHON_BIN=$(command -v python3 || command -v python || true)
+              if [ -z "$PYTHON_BIN" ]; then
+                log_error "Python runtime is required to parse Azure DevOps API JSON responses."
+                exit 1
+              fi
+
+              lock_tag="env-$(targetEnv)"
+              project_id="$(System.TeamProjectId)"
+              current_build_id="$(Build.BuildId)"
+              definition_id="$(System.DefinitionId)"
+              org_url="$(System.CollectionUri)"
+              auth_header=$(printf ':%s' "$SYSTEM_ACCESSTOKEN" | base64 | tr -d '\n')
+
+              query_url="${org_url}${project_id}/_apis/build/builds?definitions=${definition_id}&statusFilter=notStarted,inProgress&tagFilters=${lock_tag}&queryOrder=queueTimeAscending&api-version=7.1"
+
+              max_attempts=240
+              sleep_seconds=15
+
+              log_info "Waiting for environment lock '${lock_tag}'."
+              log_info "Current run id: ${current_build_id}; max attempts: ${max_attempts}; sleep: ${sleep_seconds}s."
+              log_info "Query endpoint: ${query_url}"
+
+              for attempt in $(seq 1 "$max_attempts"); do
+                response=$(curl -sS "$query_url" -H "Authorization: Basic ${auth_header}")
+
+                oldest_id=$(printf '%s' "$response" | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); ids=sorted(int(item['id']) for item in d.get('value', []) if 'id' in item); print(ids[0] if ids else '')")
+                active_ids=$(printf '%s' "$response" | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); ids=sorted(int(item['id']) for item in d.get('value', []) if 'id' in item); print(','.join(map(str, ids)))")
+
+                if [ -z "$oldest_id" ]; then
+                  log_info "No active runs found for '${lock_tag}'. Lock is free; continuing."
+                  break
+                fi
+
+                if [ "$oldest_id" = "$current_build_id" ]; then
+                  log_info "Current run '${current_build_id}' is the oldest active run for '${lock_tag}'. Continuing."
+                  break
+                fi
+
+                log_info "Attempt ${attempt}/${max_attempts}: lock held by older run '${oldest_id}'. Active '${lock_tag}' run IDs: [${active_ids}]."
+                sleep "$sleep_seconds"
+
+                if [ "$attempt" -eq "$max_attempts" ]; then
+                  log_error "Timed out waiting for '${lock_tag}' after ${max_attempts} attempts (~$((max_attempts * sleep_seconds))s)."
+                  exit 1
+                fi
+              done
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+        - task: Bash@3
+          displayName: Hold Lock (5 Minutes)
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -euo pipefail
+
+              log_info() { printf '[INFO] %s\n' "$1"; }
+
+              sleep_seconds=300
+              log_info "Holding pipeline for ${sleep_seconds}s to keep environment lock active."
+              sleep "$sleep_seconds"
+              log_info "Sleep period completed; pipeline can proceed to next steps."
