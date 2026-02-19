@@ -1,0 +1,20 @@
+### Getting parameters from the main pipeline ###
+parameters:
+- name: targetEnv
+  default: dev
+  type: string
+
+### Defining run variables ###
+variables:
+  # Selection agent pool
+  - name: agentPool
+    ${{ if startsWith(parameters.targetEnv, 'dev') }}:
+      value: 'Oboba-SelfHosted-VMSS-AgentPool-DEV'
+    ${{ if startsWith(parameters.targetEnv, 'qa') }}:
+      value: 'Oboba-SelfHosted-VMSS-AgentPool-QA'
+    ${{ if startsWith(parameters.targetEnv, 'prod') }}:
+      value: 'Oboba-SelfHosted-VMSS-AgentPool-PROD'
+
+  # Defining target environment
+  - name: targetEnv
+    value: ${{ parameters.targetEnv }}
